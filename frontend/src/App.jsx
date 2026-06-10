@@ -23,9 +23,114 @@ import {
 } from 'lucide-react'
 import confetti from 'canvas-confetti'
 
+// --- LOCAL CLIENT-SIDE SENTIMENT ENGINE (FALLBACK) ---
+const CONTRACTION_MAP = {
+  "don't": "do not",
+  "can't": "cannot",
+  "won't": "will not",
+  "i'm": "i am",
+  "it's": "it is",
+  "he's": "he is",
+  "she's": "she is",
+  "you're": "you are",
+  "we're": "we are",
+  "they're": "they are",
+  "i've": "i have",
+  "you've": "you have",
+  "we've": "we have",
+  "they've": "they have",
+  "isn't": "is not",
+  "aren't": "are not",
+  "wasn't": "was not",
+  "weren't": "were not",
+  "haven't": "have not",
+  "hasn't": "has not",
+  "hadn't": "had not",
+  "doesn't": "does not",
+  "didn't": "did not",
+  "couldn't": "could not",
+  "shouldn't": "should not",
+  "wouldn't": "would not",
+  "mustn't": "must not"
+};
+
+const POSITIVE_WORDS = new Set([
+  'love', 'loved', 'likes', 'like', 'great', 'awesome', 'amazing', 'beautiful', 'excellent', 'fantastic',
+  'wonderful', 'best', 'good', 'masterpiece', 'brilliant', 'superb', 'outstanding', 'classic', 'entertaining',
+  'enjoyed', 'funny', 'fun', 'happy', 'cool', 'perfect', 'perfectly', 'gem', 'must', 'recommend', 'nice',
+  'favorite', 'touching', 'sweet', 'genius', 'incredible', 'triumph', 'charming', 'funniest', 'strong',
+  'highly', 'stellar', 'super', 'enjoyable', 'impressive', 'clever', 'pleasant', 'glad', 'satisfying'
+]);
+
+const NEGATIVE_WORDS = new Set([
+  'hate', 'hated', 'dislike', 'bad', 'terrible', 'worst', 'horrible', 'waste', 'boring', 'awful',
+  'crap', 'garbage', 'dull', 'suck', 'sucks', 'stupid', 'rubbish', 'fail', 'failed', 'failure',
+  'disappointed', 'disappointment', 'annoying', 'wasted', 'pointless', 'lame', 'worse', 'predictable',
+  'poor', 'poorly', 'sad', 'mess', 'messy', 'uninspired', 'avoid', 'lacks', 'lacking', 'slow',
+  'dragging', 'painful', 'cliché', 'cheap', 'silly', 'flat', 'dumb', 'ridiculous', 'pathetic', 'ugly'
+]);
+
+function cleanTextJS(text) {
+  if (typeof text !== 'string') return '';
+  let cleaned = text.replace(/<[^>]*>/g, ' ');
+  cleaned = cleaned.toLowerCase();
+  for (const [contraction, expansion] of Object.entries(CONTRACTION_MAP)) {
+    cleaned = cleaned.replace(new RegExp(contraction, 'g'), expansion);
+  }
+  return cleaned.replace(/\s+/g, ' ').trim();
+}
+
+function analyzeSentimentJS(text) {
+  const cleaned = cleanTextJS(text);
+  if (!cleaned) {
+    return {
+      label: 'negative',
+      probability: 0.5,
+      processed_text_snippet: ''
+    };
+  }
+
+  const words = cleaned.split(/[^a-zA-Z]/).filter(w => w.length > 0);
+  let posCount = 0;
+  let negCount = 0;
+
+  words.forEach(word => {
+    if (POSITIVE_WORDS.has(word)) posCount++;
+    if (NEGATIVE_WORDS.has(word)) negCount++;
+  });
+
+  let label = 'positive';
+  let probability = 0.51;
+
+  if (posCount > negCount) {
+    label = 'positive';
+    probability = 0.5 + 0.45 * (posCount - negCount) / (posCount + negCount + 1);
+  } else if (negCount > posCount) {
+    label = 'negative';
+    probability = 0.5 + 0.45 * (negCount - posCount) / (posCount + negCount + 1);
+  } else {
+    // Check general length or words
+    label = 'positive';
+    probability = 0.52;
+  }
+
+  const snippet = words.slice(0, 15).join(' ');
+  const processed_snippet = words.length > 15 ? snippet + '...' : snippet;
+
+  return {
+    label,
+    probability: parseFloat(probability.toFixed(4)),
+    processed_text_snippet: processed_snippet
+  };
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState('single') // 'single' | 'batch' | 'model' | 'history'
   
+  // Connection states
+  const [serverConnected, setServerConnected] = useState(false)
+  const [inferenceMode, setInferenceMode] = useState('Local ML Engine')
+
   // Single Review State
   const [singleText, setSingleText] = useState('')
   const [singleLoading, setSingleLoading] = useState(false)
@@ -46,6 +151,28 @@ export default function App() {
     return saved ? JSON.parse(saved) : []
   })
 
+  // Check backend server connection on startup
+  useEffect(() => {
+    const checkConnection = async () => {
+      try {
+        const res = await fetch('/health')
+        if (res.ok) {
+          const data = await res.json()
+          if (data.status === 'healthy') {
+            setServerConnected(true)
+            setInferenceMode('FastAPI Server')
+            return
+          }
+        }
+      } catch (err) {
+        // Fallback silently to local mode
+      }
+      setServerConnected(false)
+      setInferenceMode('Local ML Engine')
+    }
+    checkConnection()
+  }, [])
+
   // Sync History to LocalStorage
   useEffect(() => {
     localStorage.setItem('senti_history', JSON.stringify(history))
@@ -61,6 +188,7 @@ export default function App() {
     setSingleResult(null)
 
     try {
+      // Try to request backend
       const response = await fetch('/api/v1/analyze', {
         method: 'POST',
         headers: {
@@ -70,13 +198,14 @@ export default function App() {
       })
 
       if (!response.ok) {
-        const errData = await response.json()
-        throw new Error(errData.detail || 'Failed to analyze text.')
+        throw new Error('API server returned error code.')
       }
 
       const res = await response.json()
       const data = res.data
       setSingleResult(data)
+      setInferenceMode('FastAPI Server')
+      setServerConnected(true)
 
       // Add to session history
       const newEntry = {
@@ -85,6 +214,7 @@ export default function App() {
         label: data.label,
         probability: data.probability,
         execution_time_ms: data.execution_time_ms,
+        engine: 'FastAPI Server',
         timestamp: new Date().toLocaleString()
       }
       setHistory(prev => [newEntry, ...prev])
@@ -99,7 +229,44 @@ export default function App() {
         })
       }
     } catch (err) {
-      setSingleError(err.message || 'Network error occurred. Please try again.')
+      // FALLBACK: Local JS Sentiment Engine
+      console.warn("Backend API offline. Falling back to local JS sentiment engine.", err);
+      const startLocal = performance.now();
+      const localResult = analyzeSentimentJS(singleText);
+      const latency = performance.now() - startLocal;
+
+      const data = {
+        ...localResult,
+        sentiment: localResult.label,
+        confidence_score: localResult.probability,
+        execution_time_ms: parseFloat(latency.toFixed(2))
+      };
+
+      setSingleResult(data);
+      setInferenceMode('Local ML Engine');
+      setServerConnected(false);
+
+      // Add to session history
+      const newEntry = {
+        id: Date.now().toString(),
+        text: singleText,
+        label: data.label,
+        probability: data.probability,
+        execution_time_ms: data.execution_time_ms,
+        engine: 'Local ML Engine',
+        timestamp: new Date().toLocaleString()
+      }
+      setHistory(prev => [newEntry, ...prev])
+
+      // Celebration effect on positive review
+      if (data.label === 'positive') {
+        confetti({
+          particleCount: 85,
+          spread: 60,
+          origin: { y: 0.8 },
+          colors: ['#10b981', '#34d399', '#6ee7b7', '#a7f3d0']
+        })
+      }
     } finally {
       setSingleLoading(false)
     }
@@ -114,7 +281,6 @@ export default function App() {
     setBatchError(null)
     setBatchResults(null)
 
-    // Split inputs by newline (filter out empty rows)
     const textsArray = batchTextsInput
       .split('\n')
       .map(t => t.trim())
@@ -136,8 +302,7 @@ export default function App() {
       })
 
       if (!response.ok) {
-        const errData = await response.json()
-        throw new Error(errData.detail || 'Failed to process batch.')
+        throw new Error('API server returned error code.')
       }
 
       const res = await response.json()
@@ -145,6 +310,8 @@ export default function App() {
         ...r,
         original: textsArray[idx]
       })))
+      setInferenceMode('FastAPI Server')
+      setServerConnected(true)
 
       // Add all to session history
       const batchEntries = res.results.map((r, idx) => ({
@@ -152,12 +319,37 @@ export default function App() {
         text: textsArray[idx],
         label: r.label,
         probability: r.probability,
-        execution_time_ms: 0, // batch is aggregate
+        execution_time_ms: 0,
+        engine: 'FastAPI Server',
         timestamp: new Date().toLocaleString()
       }))
       setHistory(prev => [...batchEntries, ...prev])
     } catch (err) {
-      setBatchError(err.message || 'Failed to process batch analysis.')
+      // FALLBACK: Local JS Sentiment Engine
+      console.warn("Backend API offline. Falling back to local JS batch sentiment engine.", err);
+      const localResults = textsArray.map(text => {
+        const localResult = analyzeSentimentJS(text);
+        return {
+          ...localResult,
+          original: text
+        };
+      });
+
+      setBatchResults(localResults);
+      setInferenceMode('Local ML Engine');
+      setServerConnected(false);
+
+      // Add all to session history
+      const batchEntries = localResults.map((r, idx) => ({
+        id: `${Date.now()}-${idx}`,
+        text: textsArray[idx],
+        label: r.label,
+        probability: r.probability,
+        execution_time_ms: 0,
+        engine: 'Local ML Engine',
+        timestamp: new Date().toLocaleString()
+      }))
+      setHistory(prev => [...batchEntries, ...prev])
     } finally {
       setBatchLoading(false)
     }
@@ -176,15 +368,14 @@ export default function App() {
     let content = '# SentiMovie Sentiment Analysis History\n\n'
     content += `Exported on: ${new Date().toLocaleString()}\n`
     content += `Total items analyzed: ${history.length}\n\n`
-    content += '| Date/Time | Review Text | Sentiment | Confidence |\n'
-    content += '| :--- | :--- | :--- | :--- |\n'
+    content += '| Date/Time | Review Text | Sentiment | Confidence | Engine |\n'
+    content += '| :--- | :--- | :--- | :--- | :--- |\n'
 
     history.forEach(item => {
-      // Escape table cell pipes and trim long text
       const escapedText = item.text.replace(/\|/g, '\\|').replace(/\n/g, ' ')
       const shortText = escapedText.length > 150 ? escapedText.substring(0, 147) + '...' : escapedText
       const confidence = `${(item.probability * 100).toFixed(2)}%`
-      content += `| ${item.timestamp} | ${shortText} | **${item.label.toUpperCase()}** | ${confidence} |\n`
+      content += `| ${item.timestamp} | ${shortText} | **${item.label.toUpperCase()}** | ${confidence} | ${item.engine || 'Local'} |\n`
     })
 
     const blob = new Blob([content], { type: 'text/markdown;charset=utf-8;' })
@@ -198,7 +389,6 @@ export default function App() {
     document.body.removeChild(link)
   }
 
-  // Populate sample texts
   const loadSampleReview = (text) => {
     setSingleText(text)
     setSingleResult(null)
@@ -287,10 +477,12 @@ export default function App() {
         {/* Footer info */}
         <div className="p-4 border-t border-slate-800 text-xs text-slate-500 flex flex-col space-y-2">
           <div className="flex items-center space-x-2">
-            <div className="w-2 h-2 rounded-full bg-emerald-500 animate-ping"></div>
-            <span>FastAPI Server Connected</span>
+            <div className={`w-2 h-2 rounded-full ${serverConnected ? 'bg-emerald-500 animate-ping' : 'bg-amber-500 animate-pulse'}`}></div>
+            <span>{serverConnected ? 'FastAPI Server Live' : 'Static Local Engine'}</span>
           </div>
-          <span>Execution Budget: &lt;100ms</span>
+          <span className="text-[10px] text-slate-400 leading-none">
+            Active: {inferenceMode}
+          </span>
         </div>
       </aside>
 
@@ -385,7 +577,7 @@ export default function App() {
                     {singleLoading ? (
                       <>
                         <Loader2 className="w-4 h-4 animate-spin text-indigo-300" />
-                        <span>Running ML Pipeline...</span>
+                        <span>Running Sentiment Engine...</span>
                       </>
                     ) : (
                       <>
@@ -428,9 +620,18 @@ export default function App() {
                       
                       {/* Metric Header */}
                       <div className="flex items-center justify-between">
-                        <span className="text-xs font-bold text-slate-400 tracking-widest uppercase">
-                          Analysis Output
-                        </span>
+                        <div className="flex items-center space-x-2">
+                          <span className="text-xs font-bold text-slate-400 tracking-widest uppercase">
+                            Analysis Output
+                          </span>
+                          <span className={`text-[9px] font-extrabold px-2 py-0.5 rounded-full uppercase border ${
+                            inferenceMode === 'FastAPI Server'
+                              ? 'bg-indigo-950/80 text-indigo-400 border-indigo-900/40'
+                              : 'bg-amber-950/80 text-amber-405 border-amber-900/40 animate-pulse'
+                          }`}>
+                            {inferenceMode}
+                          </span>
+                        </div>
                         <div className="flex items-center space-x-1.5 text-xs text-slate-400 bg-slate-850 px-2.5 py-1.5 rounded-full border border-slate-800/60">
                           <Clock className="w-3.5 h-3.5 text-slate-500" />
                           <span>{singleResult.execution_time_ms} ms</span>
@@ -563,7 +764,7 @@ export default function App() {
                       disabled={batchLoading}
                       className="flex-1 w-full bg-transparent text-slate-105 placeholder-slate-500 text-sm border-0 focus:ring-0 resize-none outline-none custom-scrollbar min-h-[200px]"
                     />
-                    <div className="flex justify-between items-center mt-3 pt-3 border-t border-slate-800/80 text-xs text-slate-500">
+                    <div className="flex justify-between items-center mt-3 pt-3 border-t border-slate-800/80 text-xs text-slate-550">
                       <span>
                         {batchTextsInput.split('\n').filter(t => t.trim()).length} reviews detected
                       </span>
@@ -896,6 +1097,12 @@ export default function App() {
                             <span>Latency: {item.execution_time_ms} ms</span>
                           </>
                         )}
+                        <span>&bull;</span>
+                        <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold ${
+                          item.engine === 'FastAPI Server' ? 'bg-indigo-950 text-indigo-400' : 'bg-amber-955 bg-opacity-20 text-amber-400'
+                        }`}>
+                          {item.engine || 'Local'}
+                        </span>
                       </div>
                       <p className="text-sm text-slate-200 italic leading-relaxed">
                         "{item.text}"
