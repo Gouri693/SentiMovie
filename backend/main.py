@@ -203,6 +203,34 @@ async def health_check():
         "model_loaded": model_pipeline is not None
     }
 
+# Serve compiled React frontend static files
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FRONTEND_DIST = os.path.abspath(os.path.join(BASE_DIR, "..", "frontend", "dist"))
+
+if os.path.exists(FRONTEND_DIST):
+    print(f"Mounting frontend static files from: {FRONTEND_DIST}")
+    # Mount the assets folder
+    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")), name="assets")
+
+    # Serve index.html at root
+    @app.get("/")
+    async def serve_index():
+        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
+
+    # Fallback route for all other paths to support client-side routing
+    @app.get("/{fallback_path:path}")
+    async def serve_fallback(fallback_path: str):
+        # Prevent catching API endpoints
+        if fallback_path.startswith("api/") or fallback_path == "health":
+            raise HTTPException(status_code=404, detail="API endpoint not found")
+        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
+else:
+    print(f"Warning: Compiled frontend directory not found at {FRONTEND_DIST}. Serve frontend separately.")
+
 if __name__ == '__main__':
     import uvicorn
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+
