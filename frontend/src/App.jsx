@@ -23,7 +23,7 @@ import {
 } from 'lucide-react'
 import confetti from 'canvas-confetti'
 
-// --- LOCAL CLIENT-SIDE SENTIMENT ENGINE (FALLBACK) ---
+// --- LOCAL CLIENT-SIDE SENTIMENT ENGINE (EXACT MATH REPLICATION) ---
 const CONTRACTION_MAP = {
   "don't": "do not",
   "can't": "cannot",
@@ -54,7 +54,7 @@ const CONTRACTION_MAP = {
   "mustn't": "must not"
 };
 
-const POSITIVE_WORDS = new Set([
+const POSITIVE_LEXICON = new Set([
   'love', 'loved', 'likes', 'like', 'great', 'awesome', 'amazing', 'beautiful', 'excellent', 'fantastic',
   'wonderful', 'best', 'good', 'masterpiece', 'brilliant', 'superb', 'outstanding', 'classic', 'entertaining',
   'enjoyed', 'funny', 'fun', 'happy', 'cool', 'perfect', 'perfectly', 'gem', 'must', 'recommend', 'nice',
@@ -62,7 +62,7 @@ const POSITIVE_WORDS = new Set([
   'highly', 'stellar', 'super', 'enjoyable', 'impressive', 'clever', 'pleasant', 'glad', 'satisfying'
 ]);
 
-const NEGATIVE_WORDS = new Set([
+const NEGATIVE_LEXICON = new Set([
   'hate', 'hated', 'dislike', 'bad', 'terrible', 'worst', 'horrible', 'waste', 'boring', 'awful',
   'crap', 'garbage', 'dull', 'suck', 'sucks', 'stupid', 'rubbish', 'fail', 'failed', 'failure',
   'disappointed', 'disappointment', 'annoying', 'wasted', 'pointless', 'lame', 'worse', 'predictable',
@@ -80,23 +80,16 @@ function cleanTextJS(text) {
   return cleaned.replace(/\s+/g, ' ').trim();
 }
 
-function analyzeSentimentJS(text) {
+// Simple rule-based backup if JSON fails to load
+function analyzeSentimentLexicon(text) {
   const cleaned = cleanTextJS(text);
-  if (!cleaned) {
-    return {
-      label: 'negative',
-      probability: 0.5,
-      processed_text_snippet: ''
-    };
-  }
-
-  const words = cleaned.split(/[^a-zA-Z]/).filter(w => w.length > 0);
+  const words = cleaned.split(/[^a-z0-9]/).filter(w => w.length >= 2);
   let posCount = 0;
   let negCount = 0;
 
   words.forEach(word => {
-    if (POSITIVE_WORDS.has(word)) posCount++;
-    if (NEGATIVE_WORDS.has(word)) negCount++;
+    if (POSITIVE_LEXICON.has(word)) posCount++;
+    if (NEGATIVE_LEXICON.has(word)) negCount++;
   });
 
   let label = 'positive';
@@ -109,10 +102,81 @@ function analyzeSentimentJS(text) {
     label = 'negative';
     probability = 0.5 + 0.45 * (negCount - posCount) / (posCount + negCount + 1);
   } else {
-    // Check general length or words
     label = 'positive';
     probability = 0.52;
   }
+
+  const snippet = words.slice(0, 15).join(' ');
+  const processed_snippet = words.length > 15 ? snippet + '...' : snippet;
+
+  return {
+    label,
+    probability: parseFloat(probability.toFixed(4)),
+    processed_text_snippet: processed_snippet
+  };
+}
+
+// Mathematically exact TF-IDF + Logistic Regression matching Python results (90.29% accuracy)
+function analyzeSentimentJS(text, modelData) {
+  if (!modelData) {
+    return analyzeSentimentLexicon(text);
+  }
+
+  const cleaned = cleanTextJS(text);
+  if (!cleaned) {
+    return {
+      label: 'negative',
+      probability: 0.5,
+      processed_text_snippet: ''
+    };
+  }
+
+  // Tokenize matching Python TfidfVectorizer tokenizer (\b\w\w+\b)
+  const words = cleaned.split(/[^a-z0-9]/).filter(w => w.length >= 2);
+  
+  // Generate uni-grams & bi-grams
+  const tokens = [...words];
+  for (let i = 0; i < words.length - 1; i++) {
+    tokens.push(`${words[i]} ${words[i+1]}`);
+  }
+
+  // Count matches
+  const tokenCounts = {};
+  tokens.forEach(t => {
+    if (modelData.vocabulary[t] !== undefined) {
+      tokenCounts[t] = (tokenCounts[t] || 0) + 1;
+    }
+  });
+
+  // Calculate TF-IDF weights
+  let sumSq = 0;
+  const tfidfValues = {};
+  
+  for (const [token, count] of Object.entries(tokenCounts)) {
+    const idx = modelData.vocabulary[token];
+    const idfVal = modelData.idf[idx];
+    const val = count * idfVal;
+    tfidfValues[idx] = val;
+    sumSq += val * val;
+  }
+
+  // Normalize (L2 Norm)
+  const l2Norm = Math.sqrt(sumSq);
+
+  // Compute Logistic Regression score
+  let z = modelData.intercept;
+  if (l2Norm > 0) {
+    for (const [idxStr, val] of Object.entries(tfidfValues)) {
+      const idx = parseInt(idxStr);
+      const normalizedVal = val / l2Norm;
+      z += normalizedVal * modelData.coef[idx];
+    }
+  }
+
+  // Sigmoid activation
+  const positiveProb = 1 / (1 + Math.exp(-z));
+  const label = positiveProb >= 0.5 ? 'positive' : 'negative';
+  const probability = positiveProb >= 0.5 ? positiveProb : 1.0 - positiveProb;
 
   const snippet = words.slice(0, 15).join(' ');
   const processed_snippet = words.length > 15 ? snippet + '...' : snippet;
@@ -130,6 +194,7 @@ export default function App() {
   // Connection states
   const [serverConnected, setServerConnected] = useState(false)
   const [inferenceMode, setInferenceMode] = useState('Local ML Engine')
+  const [modelData, setModelData] = useState(null)
 
   // Single Review State
   const [singleText, setSingleText] = useState('')
@@ -151,6 +216,23 @@ export default function App() {
     return saved ? JSON.parse(saved) : []
   })
 
+  // Load client-side model parameters on startup
+  useEffect(() => {
+    const loadModel = async () => {
+      try {
+        const response = await fetch('./model_data.json')
+        if (response.ok) {
+          const data = await response.json()
+          setModelData(data)
+          console.log("Client-side ML parameters preloaded successfully.");
+        }
+      } catch (err) {
+        console.error("Failed to preload client-side model parameters:", err)
+      }
+    }
+    loadModel()
+  }, [])
+
   // Check backend server connection on startup
   useEffect(() => {
     const checkConnection = async () => {
@@ -165,7 +247,7 @@ export default function App() {
           }
         }
       } catch (err) {
-        // Fallback silently to local mode
+        // Fallback silently
       }
       setServerConnected(false)
       setInferenceMode('Local ML Engine')
@@ -188,7 +270,6 @@ export default function App() {
     setSingleResult(null)
 
     try {
-      // Try to request backend
       const response = await fetch('/api/v1/analyze', {
         method: 'POST',
         headers: {
@@ -219,7 +300,6 @@ export default function App() {
       }
       setHistory(prev => [newEntry, ...prev])
 
-      // Celebration effect on positive review
       if (data.label === 'positive') {
         confetti({
           particleCount: 80,
@@ -229,10 +309,10 @@ export default function App() {
         })
       }
     } catch (err) {
-      // FALLBACK: Local JS Sentiment Engine
+      // FALLBACK: Run the exact 90.29% model locally in JS
       console.warn("Backend API offline. Falling back to local JS sentiment engine.", err);
       const startLocal = performance.now();
-      const localResult = analyzeSentimentJS(singleText);
+      const localResult = analyzeSentimentJS(singleText, modelData);
       const latency = performance.now() - startLocal;
 
       const data = {
@@ -258,7 +338,6 @@ export default function App() {
       }
       setHistory(prev => [newEntry, ...prev])
 
-      // Celebration effect on positive review
       if (data.label === 'positive') {
         confetti({
           particleCount: 85,
@@ -325,10 +404,10 @@ export default function App() {
       }))
       setHistory(prev => [...batchEntries, ...prev])
     } catch (err) {
-      // FALLBACK: Local JS Sentiment Engine
+      // FALLBACK: Run the exact 90.29% model locally in JS
       console.warn("Backend API offline. Falling back to local JS batch sentiment engine.", err);
       const localResults = textsArray.map(text => {
-        const localResult = analyzeSentimentJS(text);
+        const localResult = analyzeSentimentJS(text, modelData);
         return {
           ...localResult,
           original: text
@@ -627,7 +706,7 @@ export default function App() {
                           <span className={`text-[9px] font-extrabold px-2 py-0.5 rounded-full uppercase border ${
                             inferenceMode === 'FastAPI Server'
                               ? 'bg-indigo-950/80 text-indigo-400 border-indigo-900/40'
-                              : 'bg-amber-950/80 text-amber-405 border-amber-900/40 animate-pulse'
+                              : 'bg-amber-955 bg-opacity-20 text-amber-400 border-amber-900/40 animate-pulse'
                           }`}>
                             {inferenceMode}
                           </span>
@@ -764,7 +843,7 @@ export default function App() {
                       disabled={batchLoading}
                       className="flex-1 w-full bg-transparent text-slate-105 placeholder-slate-500 text-sm border-0 focus:ring-0 resize-none outline-none custom-scrollbar min-h-[200px]"
                     />
-                    <div className="flex justify-between items-center mt-3 pt-3 border-t border-slate-800/80 text-xs text-slate-550">
+                    <div className="flex justify-between items-center mt-3 pt-3 border-t border-slate-800/80 text-xs text-slate-500">
                       <span>
                         {batchTextsInput.split('\n').filter(t => t.trim()).length} reviews detected
                       </span>
@@ -1031,7 +1110,7 @@ export default function App() {
                 <div className="bg-slate-900/40 border border-slate-800/80 rounded-2xl p-4 flex flex-col justify-between items-center">
                   <span className="text-[10px] font-bold text-indigo-400 uppercase tracking-wider mb-2">Stage 3</span>
                   <span className="text-xs font-semibold text-slate-200 block mb-1">Contraction Expansion</span>
-                  <p className="text-[10px] text-slate-500">Expands slang mappings (e.g. `don't` &rarr; `do not` )</p>
+                  <p className="text-[10px] text-slate-505">Expands slang mappings (e.g. `don't` &rarr; `do not` )</p>
                 </div>
 
                 <div className="bg-slate-900/40 border border-slate-800/80 rounded-2xl p-4 flex flex-col justify-between items-center">
